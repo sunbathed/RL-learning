@@ -61,12 +61,12 @@ class ReplayBuffer:
             np.asarray(state, dtype=np.float32),
             int(action),
             float(reward),
-            np.asarray(next_state, dtype=np.float32),
+            np.asarray(next_state, dtype=np.float32),   # 把输入 x 转成 NumPy 数组 ,不重复复制数据
             bool(done),
         ))
 
     def sample(self, batch_size):
-        transitions = random.sample(self.buffer, batch_size)
+        transitions = random.sample(self.buffer, batch_size)  # 从经验回放池里面取出batch_size个不同的数据（五元组）
         state, action, reward, next_state, done = zip(*transitions)
         return (np.stack(state, axis=0),
                 np.array(action, dtype=np.int64),
@@ -79,6 +79,7 @@ class ReplayBuffer:
 
 
 # ========== Q 网络 ==========
+# for just 计算Q值
 #  继承nn.Module 是定义所有神经网络模块的起点
 # state_dim：输入数据的维度，即状态空间的维度。
 # hidden_dim：隐藏层神经元的数量，决定了模型的容量。
@@ -100,42 +101,52 @@ class DQN:
     def __init__(self, state_dim, hidden_dim, action_dim, learning_rate, gamma,
                  epsilon, target_update, device):
         self.action_dim = action_dim
+
         self.q_net = Qnet(state_dim, hidden_dim, action_dim).to(device)  # 预测网络
         self.target_q_net = Qnet(state_dim, hidden_dim, action_dim).to(device)   # 目标网络
-        self.target_q_net.load_state_dict(self.q_net.state_dict())
+        self.target_q_net.load_state_dict(self.q_net.state_dict())  # 把当前网络的参数复制给目标网络。
 
+        #使用 Adam 优化器去更新 q_net 的参数。self.q_net.parameters() 是模型所有可学习的权重和偏置。
         self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=learning_rate)
+
         self.gamma = gamma
         self.epsilon = epsilon
         self.target_update = target_update
         self.count = 0
+        # ：.to(device)方法可以自由地将向量和模型在CPU和GPU等设备中迁移
         self.device = device
-#当你将模型实例像函数一样调用时，__call__方法会自动帮你调用你定义在类中的forward方法
+
+        #当你将模型实例像函数一样调用时，__call__方法会自动帮你调用你定义在类中的forward方法
     def take_action(self, state):
         # state 可能是 list/np.ndarray；确保为 (1, state_dim) 的 FloatTensor
         if np.random.random() < self.epsilon:
             return np.random.randint(self.action_dim)
-        with torch.no_grad():
+        with torch.no_grad():  # 表示只前向计算，不需要梯度（节省显存和时间）。
             state_t = torch.tensor(
                 np.asarray(state),
                 dtype=torch.float32,
                 device=self.device
-            ).unsqueeze(0)
-            return self.q_net(state_t).argmax(dim=1).item()  # 找到MAX  Q值那个
+            ).unsqueeze(0)  # 神经网络要求输入是 [batch_size, features]，即便只有一条数据也要包装成“批次”
+            # .argmax(dim=1)：找到 Q 值最大的动作。
+            # .item() 把结果从张量转成普通 Python 数字。
+            return self.q_net(state_t).argmax(dim=1).item()
 
     def update(self, transition_dict):
         states = torch.tensor(transition_dict['states'], dtype=torch.float32, device=self.device)
         actions = torch.tensor(transition_dict['actions'], dtype=torch.long, device=self.device).view(-1, 1)
         rewards = torch.tensor(transition_dict['rewards'], dtype=torch.float32, device=self.device).view(-1, 1)
         next_states = torch.tensor(transition_dict['next_states'], dtype=torch.float32, device=self.device)
+        # .view(-1,1) 把一维数组变成二维列向量，
         dones = torch.tensor(transition_dict['dones'], dtype=torch.float32, device=self.device).view(-1, 1)
         # 精准地挑选出智能体实际执行的那个动作所对应的Q值。
         # 当前 Q(s,a)
         #当 dim=0时，对于输出张量中每个位置 (i, j)，其值的计算公式为：output[i][j] = input[ index[i][j] ][j]
-        q_values = self.q_net(states).gather(1, actions)
+        q_values = self.q_net(states).gather(1, actions)  # just 按照行取列
         # 目标 Q
         with torch.no_grad():
             max_next_q = self.target_q_net(next_states).max(dim=1, keepdim=True)[0]
+            #  如果 done=1（episode 结束），则不考虑未来奖励；
+            # 如果 done=0，则考虑折扣后的未来奖励
             q_targets = rewards + self.gamma * max_next_q * (1.0 - dones)
         #  使用均方误差（MSE）来衡量当前Q值估计（q_values）与目标Q值（q_targets）之间的差异。
         #  最小化这个损失就是让Q网络的预测逐渐逼近更优的TD目标
@@ -148,6 +159,9 @@ class DQN:
         self.optimizer.step()
 
         # 软频率更新：每 step 判断一次
+        # 每执行 target_update 步，就把 q_net 参数复制到 target_q_net。
+        # 这样目标网络是「延迟更新」的，从而让训练更平稳。
+        # self.count 是用来计步的。
         if self.count % self.target_update == 0:
             self.target_q_net.load_state_dict(self.q_net.state_dict())
         self.count += 1
@@ -156,8 +170,8 @@ class DQN:
 # ========== 训练入口 ==========
 def main():
     # 超参
-    lr = 2e-3
-    num_episodes = 500
+    lr = 2e-3  # 学习率。更新神经网络参数时的步长
+    num_episodes = 500 # 总训练回合数
     hidden_dim = 128
     gamma = 0.98
     # epsilon(探索率): 在ε-贪婪策略中，控制随机探索的概率。
@@ -184,7 +198,7 @@ def main():
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
-    # Agent & Buffer
+    # Agent & Buffer 初始化智能体和经验池
     agent = DQN(state_dim, hidden_dim, action_dim, lr, gamma, epsilon, target_update, device)
     replay_buffer = ReplayBuffer(buffer_size)
 

@@ -68,6 +68,7 @@ class DoubleDQN:
     def __init__(self, state_dim, hidden_dim, action_dim,
                  learning_rate, gamma, epsilon,
                  target_update, device):
+
         self.action_dim = action_dim
         self.q_net = Qnet(state_dim, hidden_dim, action_dim).to(device)
         self.target_q_net = Qnet(state_dim, hidden_dim, action_dim).to(device)
@@ -89,13 +90,17 @@ class DoubleDQN:
         # 确保是 np.array -> torch
         if not isinstance(state, np.ndarray):
             state = np.array(state, dtype=np.float32)
-        state = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
+
+        state = torch.from_numpy(state).float().unsqueeze(0).to(self.device)  # 相当于在最前面插一维 batch 维度）
 
         with torch.no_grad():
             q_values = self.q_net(state)
 
         return q_values.argmax(dim=1).item()
 
+    # 它的功能很简单：
+    # 把状态转成张量；
+    # 取其中的最大值（max()）；
     def max_q_value(self, state):
         if not isinstance(state, np.ndarray):
             state = np.array(state, dtype=np.float32)
@@ -126,6 +131,7 @@ class DoubleDQN:
         q_targets = rewards + self.gamma * max_next_q_values * (1 - dones)
 
         loss = F.mse_loss(q_values, q_targets)
+
 
         self.optimizer.zero_grad()
         loss.backward()

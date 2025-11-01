@@ -7,12 +7,12 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import gymnasium as gym
 
+
 # ================= 工具（Gymnasium 适配） =================
-def make_env(env_id="CartPole-v1", seed=0):
+def make_env(env_id="Pendulum-v1", seed=0):
     env = gym.make(env_id)
     try: env.action_space.seed(seed)
-    except:
-        pass
+    except: pass
     try: env.observation_space.seed(seed)
     except: pass
     return env
@@ -29,13 +29,38 @@ def env_step(env, action):
 
 
 def moving_average(x, window_size):
-    if len(x) == 0:
-        return []
+    if len(x) == 0: return []
     w = min(window_size, len(x))
     cs = np.cumsum(np.insert(np.array(x, dtype=np.float32), 0, 0.0))
     ma = (cs[w:] - cs[:-w]) / w
     head = [ma[0]] * (len(x) - len(ma))
     return head + ma.tolist()
+
+
+# =============== 离散动作包装（把 Box 动作离散化） ===============
+class DiscreteActionWrapper:
+    """
+    将连续动作 Box([-a, a], shape=(1,)) 离散为 N 个力矩档位：
+    idx ∈ [0, N-1]  ->  torque ∈ linspace(-a, a, N)
+    """
+    def __init__(self, env, num_actions=11):
+        assert isinstance(env.action_space, gym.spaces.Box)
+        assert env.action_space.shape == (1,)
+        self.env = env
+        self.num_actions = num_actions
+        self.max_torque = float(env.action_space.high[0])
+        self.action_table = np.linspace(-self.max_torque, self.max_torque, num_actions, dtype=np.float32)
+
+        # 伪装成离散动作空间，便于上层算法使用
+        self.action_space = gym.spaces.Discrete(num_actions)
+        self.observation_space = env.observation_space
+
+    def reset(self, **kwargs):
+        return env_reset(self.env, **kwargs)
+
+    def step(self, discrete_idx):
+        torque = np.array([self.action_table[int(discrete_idx)]], dtype=np.float32)
+        return env_step(self.env, torque)
 
 
 # ================= Replay Buffer =================
@@ -67,7 +92,7 @@ class ReplayBuffer:
 
 # ================= 网络定义 =================
 class Qnet(torch.nn.Module):
-    """Vanilla/Double DQN 用的基本 Q 网络（两层 MLP）"""
+    """基础 Q 网络：两层 MLP"""
     def __init__(self, state_dim, hidden_dim, action_dim):
         super().__init__()
         self.fc1 = torch.nn.Linear(state_dim, hidden_dim)
@@ -79,29 +104,28 @@ class Qnet(torch.nn.Module):
 
 
 class VAnet(torch.nn.Module):
-    """Dueling 结构：共享干道 + A/V 两个头"""
+    """Dueling：共享干道 + A/V 两头"""
     def __init__(self, state_dim, hidden_dim, action_dim):
         super().__init__()
-        self.fc1  = torch.nn.Linear(state_dim, hidden_dim)   # 共享干道
-
-        self.fc_A = torch.nn.Linear(hidden_dim, action_dim)  # 优势头
-        self.fc_V = torch.nn.Linear(hidden_dim, 1)           # 价值头
+        self.fc1  = torch.nn.Linear(state_dim, hidden_dim)
+        self.fc_A = torch.nn.Linear(hidden_dim, action_dim)
+        self.fc_V = torch.nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
-        shared = F.relu(self.fc1(x))               # 只做一次前向！ 把输入状态经过 ReLU 激活，得到共享特征。
-        A = self.fc_A(shared)                      # (B, A)
-        V = self.fc_V(shared)                      # (B, 1)
-        A = A - A.mean(dim=1, keepdim=True)        # 减去均值，避免不可辨识性
-        Q = V + A                                  # (B, A)
-        return Q
+        shared = F.relu(self.fc1(x))           # 只前向一次
+        A = self.fc_A(shared)                  # (B, A)
+        V = self.fc_V(shared)                  # (B, 1)
+        A = A - A.mean(dim=1, keepdim=True)    # 去均值，避免不可辨识性
+        return V + A                           # (B, A)
 
-# ================= DQN 家族（Vanilla / Double / Dueling） =================
+
+
+# ================= DQN / Double / Dueling =================
 class DQN:
     """
-    dqn_type: ['VanillaDQN', 'DoubleDQN', 'DuelingDQN']
-    - VanillaDQN: 目标= target_q_net(s').max()
-    - DoubleDQN : argmax 在 online，估值在 target
-    - DuelingDQN: 使用 V/A 头的网络结构（目标计算可选 Vanilla/Double；此处给出常见配置：Dueling + Double）
+    dqn_type: 'VanillaDQN' / 'DoubleDQN' / 'DuelingDQN'
+    - Double 的目标：argmax 用 online，估值用 target
+    - Dueling 使用 V/A 结构；目标计算默认按 Double（常用组合：Dueling + Double）
     """
     def __init__(self, state_dim, hidden_dim, action_dim,
                  learning_rate, gamma, epsilon,
@@ -126,7 +150,6 @@ class DQN:
         self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=learning_rate)
 
     def take_action(self, state):
-        # ε-greedy：小概率随机探索
         if np.random.random() < self.epsilon:
             return np.random.randint(self.action_dim)
         with torch.no_grad():
@@ -145,22 +168,14 @@ class DQN:
         next_states = torch.as_tensor(transition_dict['next_states'], dtype=torch.float32, device=self.device)
         dones       = torch.as_tensor(transition_dict['dones'], dtype=torch.float32, device=self.device).view(-1, 1)
 
-        # Q(s,a)
         q_values = self.q_net(states).gather(1, actions)
 
-        # 目标 y
         with torch.no_grad():
-            if self.dqn_type == 'DoubleDQN' or self.dqn_type == 'DuelingDQN':
-                # 在线网选 a*
-                next_q_online = self.q_net(next_states)
-                next_actions = next_q_online.argmax(dim=1, keepdim=True)       # (B,1)
-                # 目标网评估 Q_target(s', a*)
-                next_q_target = self.target_q_net(next_states)
-                max_next_q = next_q_target.gather(1, next_actions)             # (B,1)
+            if self.dqn_type in ('DoubleDQN', 'DuelingDQN'):
+                next_actions = self.q_net(next_states).argmax(dim=1, keepdim=True)
+                max_next_q = self.target_q_net(next_states).gather(1, next_actions)
             else:
-                # Vanilla
                 max_next_q = self.target_q_net(next_states).max(dim=1, keepdim=True)[0]
-
             q_targets = rewards + self.gamma * max_next_q * (1.0 - dones)
 
         loss = F.mse_loss(q_values, q_targets)
@@ -168,32 +183,28 @@ class DQN:
         loss.backward()
         self.optimizer.step()
 
-        # 同步目标网
         self.count += 1
         if self.count % self.target_update == 0:
             self.target_q_net.load_state_dict(self.q_net.state_dict())
 
-# ================= 训练 =================
+# ================= 训练循环 =================
 def train(agent, env, num_episodes, replay_buffer, minimal_size, batch_size):
-    return_list = []
-    max_q_value_list = []
+    returns, q_curve = [], []
     ema_q = 0.0
-
     for i in range(10):
         with tqdm(total=int(num_episodes/10), desc=f'Iteration {i}') as pbar:
             for j in range(int(num_episodes/10)):
-                state = env_reset(env, seed=0 if (i==0 and j==0) else None)
-                done = False
-                ep_ret = 0.0
+                state = env.reset()
+                if isinstance(state, tuple): state = state[0]  # 兼容性
+                done, ep_ret = False, 0.0
                 while not done:
                     action = agent.take_action(state)
-                    next_state, reward, done, _ = env_step(env, action)
+                    next_state, reward, done, _ = env.step(action)
                     replay_buffer.add(state, action, reward, next_state, done)
 
-                    # 记录平滑 Q 值
                     q_now = agent.max_q_value(state)
                     ema_q = 0.995 * ema_q + 0.005 * q_now
-                    max_q_value_list.append(ema_q)
+                    q_curve.append(ema_q)
 
                     state = next_state
                     ep_ret += reward
@@ -207,57 +218,56 @@ def train(agent, env, num_episodes, replay_buffer, minimal_size, batch_size):
                             'next_states': b_ns,
                             'dones': b_d
                         })
-                return_list.append(ep_ret)
-                if (j+1) % 10 == 0:
-                    pbar.set_postfix({
-                        'episode': f'{int(num_episodes/10*i+j+1)}',
-                        'return': f'{np.mean(return_list[-10:]):.2f}'
-                    })
+                returns.append(ep_ret)
+                if (j+1) % 5 == 0:
+                    pbar.set_postfix({'ret': f'{np.mean(returns[-5:]):.1f}'})
                 pbar.update(1)
-    return return_list, max_q_value_list
-
+    return returns, q_curve
 
 # ================= 主函数 =================
 def main():
-    # 超参
-    lr = 2e-3
+    # -------- 超参 --------
+    lr = 1e-3
     num_episodes = 400
-    hidden_dim = 128
+    hidden_dim = 256
     gamma = 0.99
-    epsilon = 0.05
-    target_update = 100
-    buffer_size = 50000
+    epsilon = 0.1
+    target_update = 200
+    buffer_size = 100000
     minimal_size = 1000
-    batch_size = 64
+    batch_size = 128
+    ACTION_SPACE = 11
     dqn_type = 'DuelingDQN'   # 'VanillaDQN' / 'DoubleDQN' / 'DuelingDQN'
 
     seed = 0
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    env_name = 'CartPole-v1'
-    env = make_env(env_name, seed=seed)
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
+    base_env = make_env('Pendulum-v1', seed=seed)
+    env = DiscreteActionWrapper(base_env, num_actions=ACTION_SPACE)
+
+    state_dim = env.observation_space.shape[0]   # Pendulum: 3 (cosθ, sinθ, θ_dot)
+    action_dim = env.action_space.n              # 离散动作数
 
     buffer = ReplayBuffer(buffer_size)
     agent = DQN(state_dim, hidden_dim, action_dim, lr, gamma, epsilon,
                 target_update, device, dqn_type=dqn_type)
 
+    # 训练
     returns, q_curve = train(agent, env, num_episodes, buffer, minimal_size, batch_size)
 
-    # 画图
+    # 曲线
     plt.figure()
     plt.plot(range(len(returns)), moving_average(returns, 9))
-    plt.xlabel('Episodes'); plt.ylabel('Returns'); plt.title(f'{dqn_type} on {env_name}')
+    plt.xlabel('Episodes'); plt.ylabel('Returns'); plt.title(f'{dqn_type} (Discrete) on Pendulum-v1')
     plt.show()
 
     plt.figure()
     plt.plot(range(len(q_curve)), q_curve)
-    plt.axhline(0, ls='--', c='orange'); plt.axhline(10, ls='--', c='red')
-    plt.xlabel('Frames'); plt.ylabel('Q value (EMA)'); plt.title(f'{dqn_type} on {env_name}')
+    plt.axhline(0, ls='--', c='orange')
+    plt.xlabel('Frames'); plt.ylabel('Q value (EMA)'); plt.title(f'{dqn_type} (Discrete) on Pendulum-v1')
     plt.show()
 
-
 if __name__ == "__main__":
+    # 为了兼容 tqdm 的 notebook/终端显示，这里不做额外花活
     main()
