@@ -1,22 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-单车 Actor-Critic 示例（修正奖励版）
+单车 Actor-Critic 示例（Phase-Based 最强版）
 --------------------------------
 目标：让智能体稳定学会
     空车 → 先到装载区 → 再到卸载区 → 结束回合
 
-主要设计：
-1. 奖励结构简化 & 放大关键奖励：
-   - 装载 +4.0
-   - 卸载 +6.0
-   - 撞障碍 -1.0
+设计要点：
+1. 两阶段势函数（BFS）：
+   - 空车：朝装载区的 BFS 距离 dist_to_loading
+   - 满载：朝卸载区的 BFS 距离 dist_to_unloading
+2. 阶段奖励（Phase Completion Reward）：
+   - 完成装载阶段：+8.0
+   - 完成卸载阶段：+12.0
+3. 基础奖励：
    - 每步 -0.02，成功移动 +0.05
-   - BFS 勢函数（空车靠近装载区，满载靠近卸载区）
-2. 暂时关闭：
-   - 动态可行驶距离约束
-   - 回头惩罚
-   - 重复访问惩罚
-3. 训练曲线保存到 results/onecar.png
+   - 撞障碍 -1.0
+4. 训练曲线保存到 results/onecar.png
 """
 
 import os
@@ -59,12 +58,18 @@ class SingleTruckMaze(tk.Tk, object):
         self.load_state = "empty"
 
         # ==== Reward 配置（核心）====
-        self.step_penalty = -0.02   # 每步基础惩罚：防止无意义拖时间
-        self.move_bonus = +0.05     # 成功移动奖励：鼓励前进
-        self.collision_penalty = -1.0   # 撞障碍惩罚：明确告诉“不要撞”
-        self.reward_load = +4.0     # 空车到装载区奖励：引导先装载
-        self.reward_unload = +6.0   # 满载到卸载区奖励：完成任务大奖励
-        self.shaping_coef = 0.6     # 勢函数系数：每靠目标进 1 步约 +0.6
+        # 基础步进相关
+        self.step_penalty = -0.02      # 每步基础惩罚：防止无意义拖时间
+        self.move_bonus = +0.05        # 成功移动奖励：鼓励前进
+        self.collision_penalty = -1.0  # 撞障碍惩罚：明确告诉“不要撞”
+
+        # Phase completion 奖励（子任务完成奖励）
+        self.reward_load_phase = +8.0   # 完成装载阶段
+        self.reward_unload_phase = +12.0  # 完成卸载阶段（整个回合）
+
+        # 两阶段势函数系数
+        self.shaping_coef_load = 1.0    # 空车 → 装载区
+        self.shaping_coef_unload = 1.3  # 满载 → 卸载区
 
         # 终止标志
         self.is_done = False
@@ -221,6 +226,7 @@ class SingleTruckMaze(tk.Tk, object):
         nr, nc = r, c
         moved = False
         collision = False
+        done = False
 
         # 暂时不做“可行驶距离限制”，只要不是“停”就能动
         if action != 4:  # 4=停
@@ -243,7 +249,6 @@ class SingleTruckMaze(tk.Tk, object):
             collision = True
             moved = False
 
-        # ======== Reward 设计（简化版）========
         # ======== Phase-based Reward Shaping（最强版本）========
 
         reward = 0.0
@@ -253,7 +258,7 @@ class SingleTruckMaze(tk.Tk, object):
 
         # 2. 成功移动奖励
         if moved:
-            reward += self.move_bonus  # +0.1 左右
+            reward += self.move_bonus  # +0.05
 
         # 3. Phase-based Potential Shaping（两阶段势函数）
         if self.load_state == "empty":
@@ -261,31 +266,35 @@ class SingleTruckMaze(tk.Tk, object):
             d_prev = self.dist_to_loading[r][c]
             d_now = self.dist_to_loading[nr][nc]
             diff = d_prev - d_now
-            reward += 1.2 * diff  # ★ 第一阶段 shaping 放大
+            reward += self.shaping_coef_load * diff     # 一步靠近 → +1.0
         else:
             # Phase 2：朝卸载区
             d_prev = self.dist_to_unloading[r][c]
             d_now = self.dist_to_unloading[nr][nc]
             diff = d_prev - d_now
-            reward += 1.5 * diff  # ★ 第二阶段 shaping 更强
+            reward += self.shaping_coef_unload * diff   # 一步靠近 → +1.3
 
         # 4. 撞障碍惩罚
         if collision:
             reward += self.collision_penalty  # -1.0
 
         # 5. Phase Completion Reward（阶段完成奖励）
-        #    ------ 关键！让 agent 知道“完成一个子任务”很重要 ------
 
         # 完成装载区（phase 1 完成）
         if (nr, nc) == self.loading_rc and self.load_state == "empty":
-            reward += 10.0  # ★ 强 phase 奖励
+            reward += self.reward_load_phase   # +8.0
             self.load_state = "full"
 
         # 完成卸载区（phase 2 完成 → episode 结束）
         if (nr, nc) == self.unloading_rc and self.load_state == "full":
-            reward += 15.0  # ★ 更强 phase 完成奖励
+            reward += self.reward_unload_phase  # +12.0
             done = True
             self.is_done = True
+
+        # 画面移动
+        dr = (nc - c) * UNIT  # x方向：列
+        dc = (nr - r) * UNIT  # y方向：行
+        self.canvas.move(self.truck_item, dr, dc)
 
         self.update()
 
@@ -362,6 +371,7 @@ class SingleAgentActorCritic:
                              device=self.device).unsqueeze(0)
         probs = self.actor(state)  # [1, n_actions]
         dist = torch.distributions.Categorical(probs)
+
         action = dist.sample().item()
         return action
 
