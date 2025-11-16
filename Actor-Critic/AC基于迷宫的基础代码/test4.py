@@ -418,5 +418,5 @@ if __name__ == "__main__":
     )
 
     trainer = Trainer(env, agent, max_episodes=600, max_steps=80)
-    env.after(100, trainer.run)
+    env.after(10, trainer.run)
     env.mainloop()

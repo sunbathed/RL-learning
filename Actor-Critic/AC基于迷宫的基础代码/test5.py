@@ -269,6 +269,8 @@ class ActorCritic:
 
         # TD 目标：r + γV(s')
         td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
+        # ★ Critic 防爆：目标裁剪
+        # d_target = torch.clamp(td_target, -5.0, 5.0)
         td_delta = td_target - self.critic(states)
 
         # 策略梯度项
@@ -383,7 +385,7 @@ class Trainer:
         plt.title("Actor-Critic Maze (γ & 熵衰减稳定版)")
         plt.legend()
         plt.grid(alpha=0.3)
-        save_path = os.path.join("results", "maze_plot.png")
+        save_path = os.path.join("results", "maze_plot——1.png")
         plt.savefig(save_path, dpi=300)
         plt.show()
         print(f"✅ 图像已保存到：{save_path}")
