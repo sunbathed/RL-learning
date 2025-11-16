@@ -24,23 +24,16 @@
 
 ## 🧠 算法原理
 
-**Actor-Critic** 结合了策略梯度（Policy Gradient）与时序差分（Temporal Difference, TD）思想：
+Actor-Critic 结合了策略梯度 (Policy Gradient) 与时序差分 (Temporal Difference, TD) 思想：
 
-$$
-\text{TD Target:} \quad y_t = r_t + \gamma V(s_{t+1})
-$$
+- **TD Target:**  y_t = r_t + γ · V(s_{t+1})
+- **TD Error:**   δ_t = y_t − V(s_t)
+- **Policy Update:**  ∇θ J ∝ δ_t ∇θ log πθ(a_t | s_t)
 
-$$
-\text{TD Error:} \quad \delta_t = y_t - V(s_t)
-$$
-
-$$
-\text{Policy Update:} \quad \nabla_\theta J \propto \delta_t \nabla_\theta \log \pi_\theta(a_t|s_t)
-$$
-
-- **Actor**：学习策略 \( \pi(a|s) \)，决定动作选择；
-- **Critic**：估计价值函数 \( V(s) \)，提供更新信号；
-- **熵正则项 (Entropy)**：鼓励分布多样性，促进探索。
+其中：
+- Actor：学习策略 π(a|s)，控制动作选择；
+- Critic：估计价值函数 V(s)，提供 TD 误差信号；
+- 熵正则项 (Entropy)：通过增加策略分布熵鼓励探索。
 
 ---
 

@@ -1,4 +1,4 @@
-
+# -*- coding: utf-8 -*-
 """
 Actor-Critic 强化学习示例：迷宫导航
 -----------------------------------------
@@ -158,13 +158,15 @@ class Maze(tk.Tk, object):
 
     # ------------------------------------------------------------
     def step(self, action):
+        """执行一个动作，返回 (next_state, reward, done)"""
         if self.is_done:
             return 'terminal', 0.0, True
 
         s = self.canvas.coords(self.rect)
         rc = self._coords_to_rc(s)
-
         move = np.array([0, 0])
+
+        # 动作映射：0上 1下 2右 3左
         if action == 0 and rc[0] > 0:
             move[1] -= UNIT
         elif action == 1 and rc[0] < MAZE_H - 1:
@@ -178,6 +180,7 @@ class Maze(tk.Tk, object):
         s_ = self.canvas.coords(self.rect)
         rc_ = self._coords_to_rc(s_)
 
+        # ===== 终止条件 =====
         if rc_ == self.goal_rc:
             self.is_done = True
             return 'terminal', 5.0, True
@@ -185,25 +188,18 @@ class Maze(tk.Tk, object):
             self.is_done = True
             return 'terminal', -1.0, True
 
-        # ========= 新奖励机制（完全替换） =========
+        # ===== 中间奖励计算 =====
         reward = self.step_penalty
-
-        # --- 势函数 + tanh 平滑 ---
+        # 势函数奖励：离终点更近,加分
         d_prev = self.dist_map[rc[0]][rc[1]]
         d_now = self.dist_map[rc_[0]][rc_[1]]
         if np.isfinite(d_prev) and np.isfinite(d_now):
-            diff = d_prev - d_now
-            reward += 0.3 * np.tanh(diff)
-
-        # --- 动态步惩罚：离目标越近惩罚越小 ---
-        reward += -0.005 * (self.dist_map[rc_[0]][rc_[1]] / (MAZE_H + MAZE_W))
-
-        # --- 来回横跳 ---
+            reward += 0.25 * (d_prev - d_now)
+        # 来回惩罚
         if self.prev_rc == rc_:
             reward -= 0.05
         self.prev_rc = rc
-
-        # --- 重复访问 ---
+        # 重复访问惩罚
         self.visit_count[rc_] = self.visit_count.get(rc_, 0) + 1
         if self.visit_count[rc_] > 4:
             reward -= 0.01
@@ -264,19 +260,18 @@ class ActorCritic:
         return dist.sample().item()
 
     def update(self, traj):
+        """一次轨迹更新（批量 TD 误差 + 策略梯度）"""
         states = torch.tensor(np.array(traj['states']), dtype=torch.float32).to(self.device)
         actions = torch.tensor(traj['actions'], dtype=torch.int64).view(-1, 1).to(self.device)
         rewards = torch.tensor(traj['rewards'], dtype=torch.float32).view(-1, 1).to(self.device)
         next_states = torch.tensor(np.array(traj['next_states']), dtype=torch.float32).to(self.device)
         dones = torch.tensor(traj['dones'], dtype=torch.float32).view(-1, 1).to(self.device)
 
+        # TD 目标：r + γV(s')
         td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
-
-        # ★ Critic 防爆：目标裁剪
-        td_target = torch.clamp(td_target, -5.0, 5.0)
-
         td_delta = td_target - self.critic(states)
 
+        # 策略梯度项
         probs = self.actor(states)
         log_probs = torch.log(probs.gather(1, actions) + 1e-8)
         entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1, keepdim=True).mean()
